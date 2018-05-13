@@ -26,10 +26,10 @@ MNIST_PATH="./data"
 MNIST_DOWNLOAD=False
 
 MODE='train'
-GPU_NUM=1
+MULTIGPU=False
 #===================================================================
 class Gpart(nn.Module):
-    def __init__(self, gpu):
+    def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
                 nn.ConvTranspose2d(NOISE_SIZE, 512, 4, 1, bias=False),
@@ -47,17 +47,12 @@ class Gpart(nn.Module):
                 nn.ConvTranspose2d(64, 1, 4, 2, padding=1, bias=False),
                 nn.Tanh())
 
-        self.gpu = gpu
-
     def forward(self, x):
-        if self.gpu > 1:
-            out = nn.parallel.data_parallel(self.main, x, range(self.gpu))
-        else:
-            out = self.main(x)
+        out = self.main(x)
         return out
 
 class Dpart(nn.Module):
-    def __init__(self, gpu):
+    def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
                 nn.Conv2d(1, 64, 4, 2, padding=1, bias=False),
@@ -74,17 +69,12 @@ class Dpart(nn.Module):
                 nn.Conv2d(512, 1, 4, 1, bias=False),
                 nn.Sigmoid())
 
-        self.gpu = gpu
-
     def forward(self, x):
-        if self.gpu > 1:
-            out = nn.parallel.data_parallel(self.main, x, range(self.gpu))
-        else:
-            out = self.main(x)
+        out = self.main(x)
         return out.view(-1)
 
 class Qpart(nn.Module):
-    def __init__(self, gpu):
+    def __init__(self):
         super().__init__()
         self.main = nn.Sequential(
                 nn.Conv2d(1, 64, 4, 2, padding=1, bias=False),
@@ -103,17 +93,10 @@ class Qpart(nn.Module):
                 nn.ReLU(True),
                 nn.Linear(100, 10))
 
-        self.gpu = gpu
-
     def forward(self, x):
         bs = x.size(0)
-        if self.gpu > 1:
-            out = nn.parallel.data_parallel(self.main, x, range(self.gpu))
-            out = out.view(bs, -1, 1, 1)
-            out = nn.parallel.data_parallel(self.q_part, out, range(self.gpu))
-        else:
-            out = self.main(x).view(bs, -1)
-            out = self.q_part(out)
+        out = self.main(x).view(bs, -1)
+        out = self.q_part(out)
 
         return out
 #===================================================================
@@ -129,7 +112,8 @@ def train(epoch):
     print("Epoch: ", epoch)
 
     loss_D = 0
-    loss_G = 0
+    loss_D_fake = 0
+    loss_Q_fake = 0
     for idx, (data, _) in enumerate(train_loader):
         bs = data.size(0)
         label_noise = np.random.randint(NOISE_DIS, size=bs)
@@ -166,11 +150,11 @@ def train(epoch):
         out_D = modelD(out_G)
         label = torch.ones(bs).cuda()
         loss_D_noise = criterionD(out_D, V(label))
-        loss_G += loss_D_noise.data
+        loss_D_fake += loss_D_noise.data
 
         out_Q = modelQ(out_G)
         loss_Q = critetionQ(out_Q, V(label_noise))
-        loss_G += loss_Q.data
+        loss_Q_fake += loss_Q.data
 
         loss_G_noise = loss_D_noise + loss_Q
         loss_G_noise.backward()
@@ -178,54 +162,65 @@ def train(epoch):
         optimG.step()
 
         progress_bar(idx, len(train_loader),
-                    'DLoss: %.3f, GLoss: %.3f' 
-                    % ((loss_D/(idx+1)), (loss_G/(idx+1))))
+                'DLoss: %.3f, DFLoss: %.3f, QLoss: %.3f' 
+                    % ((loss_D/(idx+1)), (loss_D_fake/(idx+1)), 
+                        (loss_Q_fake/(idx+1))))
 
 def load_model():
     modelG = torch.load('model.pkl').cuda()
-
-    label_noise = np.random.randint(NOISE_DIS, size=BATCH_SIZE)
-    onehot = np.zeros((BATCH_SIZE, NOISE_DIS))
-    onehot[range(BATCH_SIZE), label_noise] = 1
-    onehot = torch.from_numpy(onehot).type(torch.FloatTensor).cuda()
-    noise = torch.Tensor(BATCH_SIZE, NOISE_CON).cuda().uniform_(-1, 1)
-    noise = V(torch.cat((noise, onehot), 1)).view(-1, NOISE_SIZE, 1, 1)
-
+    
+    label_noise = np.arange(NOISE_DIS)
+    label_noise = np.tile(label_noise, 10)
+    onehot = np.zeros((10 * NOISE_DIS, NOISE_DIS))
+    onehot[range(10 * NOISE_DIS), label_noise] = 1
+    onehot = torch.from_numpy(onehot).type(torch.FloatTensor)
+    noise = torch.Tensor(10, NOISE_CON).uniform_(-1, 1).numpy()
+    noise = torch.from_numpy(np.repeat(noise, 10, axis=0))
+    noise = torch.cat((noise, onehot), 1).view(-1, NOISE_SIZE, 1, 1).cuda()
+    
     sample = modelG(noise).cpu()
     save_image(sample.data, 'output.jpg', nrow=10)
 
 if __name__ == '__main__':
-    T = transforms.Compose([transforms.Resize(IMAGE_SIZE),
-                            transforms.ToTensor()])
-    train_loader = torch.utils.data.DataLoader(
-            datasets.MNIST(MNIST_PATH, train=True, download=MNIST_DOWNLOAD
-                        , transform=T),
-            batch_size=BATCH_SIZE,
-            shuffle=True, num_workers=4, 
-            )
-    test_loader = torch.utils.data.DataLoader(
-            datasets.MNIST(MNIST_PATH, train=False, download=MNIST_DOWNLOAD
-                        , transform=T),
-            batch_size=100,
-            shuffle=True, num_workers=4, 
-            )
-
-    cudnn.benchmark = True
-
-    modelG = Gpart(GPU_NUM).cuda().apply(weights_init)
-    modelD = Dpart(GPU_NUM).cuda().apply(weights_init)
-    modelQ = Qpart(GPU_NUM).cuda().apply(weights_init)
-
-    criterionD = nn.BCELoss().cuda()
-    critetionQ = nn.CrossEntropyLoss().cuda()
-
-    optimD = optim.Adam(modelD.parameters(), lr=LR_D, betas=(0.5, 0.99))
-    optimG = optim.Adam([{'params':modelG.parameters()}, {'params':modelQ.parameters()}]
-                        , lr=LR_Q, betas=(0.5, 0.99))
-
     if MODE == 'load':
         load_model()
     else:
+        T = transforms.Compose([transforms.Resize(IMAGE_SIZE),
+                                transforms.ToTensor()])
+        train_loader = torch.utils.data.DataLoader(
+                datasets.MNIST(MNIST_PATH, train=True, download=MNIST_DOWNLOAD
+                            , transform=T),
+                batch_size=BATCH_SIZE,
+                shuffle=True, num_workers=4, 
+                )
+        test_loader = torch.utils.data.DataLoader(
+                datasets.MNIST(MNIST_PATH, train=False, download=MNIST_DOWNLOAD
+                            , transform=T),
+                batch_size=100,
+                shuffle=True, num_workers=4, 
+                )
+
+        cudnn.benchmark = True
+
+        modelG = Gpart().cuda().apply(weights_init)
+        modelD = Dpart().cuda().apply(weights_init)
+        modelQ = Qpart().cuda().apply(weights_init)
+
+        if MULTIGPU:
+            modelG = torch.nn.DataParallel(modelG.cuda(), device_ids=[0])
+            modelD = torch.nn.DataParallel(modelD.cuda(), device_ids=[0])
+            modelQ = torch.nn.DataParallel(modelQ.cuda(), device_ids=[0])
+
+        criterionD = nn.BCELoss().cuda()
+        critetionQ = nn.CrossEntropyLoss().cuda()
+
+        optimD = optim.Adam(modelD.parameters(), lr=LR_D, betas=(0.5, 0.99))
+        optimG = optim.Adam([{'params':modelG.parameters()}, {'params':modelQ.parameters()}]
+                            , lr=LR_Q, betas=(0.5, 0.99))
+
         for epoch in range(EPOCH):
+            if (epoch + 1) % 10 == 0:
+                torch.save(modelG, 'model' + str(epoch) + '.pkl')
             train(epoch)
+        
         torch.save(modelG, 'model.pkl')
