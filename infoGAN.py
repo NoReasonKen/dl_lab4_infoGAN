@@ -1,4 +1,4 @@
-#!/usr/local/anaconda3/bin/python3
+#!/usr/bin/python3
 
 import numpy as np
 import torch
@@ -20,13 +20,13 @@ NOISE_SIZE=NOISE_CON + NOISE_DIS
 IMAGE_SIZE=NOISE_SIZE
 LR_D=2e-4
 LR_Q=1e-3
-EPOCH=1
+EPOCH=80
 
 MNIST_PATH="./data"
 MNIST_DOWNLOAD=False
 
 MODE='train'
-MULTIGPU=False
+MULTIGPU=True
 #===================================================================
 class Gpart(nn.Module):
     def __init__(self):
@@ -121,7 +121,7 @@ def train(epoch):
         onehot[range(bs), label_noise] = 1
         label_noise = torch.from_numpy(label_noise).type(torch.LongTensor).cuda()
         onehot = torch.from_numpy(onehot).type(torch.FloatTensor).cuda()
-        noise = torch.Tensor(bs, NOISE_CON).cuda().uniform_(-1, 1)
+        noise = torch.Tensor(bs, NOISE_CON).cuda().normal_()
         noise = torch.cat((noise, onehot), 1).view(-1, NOISE_SIZE, 1, 1)
         data = data.cuda()
 
@@ -162,28 +162,29 @@ def train(epoch):
         optimG.step()
 
         progress_bar(idx, len(train_loader),
-                'DLoss: %.3f, DFLoss: %.3f, QLoss: %.3f' 
+                    'DLoss: %.3f, DFLoss: %.3f, QLoss: %.3f, GLoss: %.3f' 
                     % ((loss_D/(idx+1)), (loss_D_fake/(idx+1)), 
-                        (loss_Q_fake/(idx+1))))
+                        (loss_Q_fake/(idx+1)), (loss_G_noise/(idx+1))))
 
-def load_model():
-    modelG = torch.load('model.pkl').cuda()
-    
-    label_noise = np.arange(NOISE_DIS)
-    label_noise = np.tile(label_noise, 10)
-    onehot = np.zeros((10 * NOISE_DIS, NOISE_DIS))
-    onehot[range(10 * NOISE_DIS), label_noise] = 1
-    onehot = torch.from_numpy(onehot).type(torch.FloatTensor)
-    noise = torch.Tensor(10, NOISE_CON).uniform_(-1, 1).numpy()
-    noise = torch.from_numpy(np.repeat(noise, 10, axis=0))
-    noise = torch.cat((noise, onehot), 1).view(-1, NOISE_SIZE, 1, 1).cuda()
-    
-    sample = modelG(noise).cpu()
-    save_image(sample.data, 'output.jpg', nrow=10)
+def load_model(maxi):
+    for i in range(1, maxi):
+        modelG = torch.load('model'+i+'0.pkl').cuda()
+        
+        label_noise = np.arange(NOISE_DIS)
+        label_noise = np.tile(label_noise, 10)
+        onehot = np.zeros((10 * NOISE_DIS, NOISE_DIS))
+        onehot[range(10 * NOISE_DIS), label_noise] = 1
+        onehot = torch.from_numpy(onehot).type(torch.FloatTensor)
+        noise = torch.Tensor(10, NOISE_CON).normal_().numpy()
+        noise = torch.from_numpy(np.repeat(noise, 10, axis=0))
+        noise = torch.cat((noise, onehot), 1).view(-1, NOISE_SIZE, 1, 1).cuda()
+
+        sample = modelG(noise).cpu()
+        save_image(sample.data, 'output'+i+'0.jpg', nrow=10)
 
 if __name__ == '__main__':
     if MODE == 'load':
-        load_model()
+        load_model(EPOCH / 10)
     else:
         T = transforms.Compose([transforms.Resize(IMAGE_SIZE),
                                 transforms.ToTensor()])
@@ -193,18 +194,12 @@ if __name__ == '__main__':
                 batch_size=BATCH_SIZE,
                 shuffle=True, num_workers=4, 
                 )
-        test_loader = torch.utils.data.DataLoader(
-                datasets.MNIST(MNIST_PATH, train=False, download=MNIST_DOWNLOAD
-                            , transform=T),
-                batch_size=100,
-                shuffle=True, num_workers=4, 
-                )
 
         cudnn.benchmark = True
 
-        modelG = Gpart().cuda().apply(weights_init)
-        modelD = Dpart().cuda().apply(weights_init)
-        modelQ = Qpart().cuda().apply(weights_init)
+        modelG = Gpart().cuda()
+        modelD = Dpart().cuda()
+        modelQ = Qpart().cuda()
 
         if MULTIGPU:
             modelG = torch.nn.DataParallel(modelG.cuda(), device_ids=[0])
@@ -219,8 +214,8 @@ if __name__ == '__main__':
                             , lr=LR_Q, betas=(0.5, 0.99))
 
         for epoch in range(EPOCH):
-            if (epoch + 1) % 10 == 0:
-                torch.save(modelG, 'model' + str(epoch) + '.pkl')
             train(epoch)
+            if epoch % 10 == 0 and epoch != 0:
+                torch.save(modelG, 'model' + str(epoch) + '.pkl')
         
-        torch.save(modelG, 'model.pkl')
+        torch.save(modelG, 'model80.pkl')
